@@ -1,0 +1,2 @@
+1,Golden Coin,45.1234,23.5678,O comoară veche în munți,100
+2,Silver Ring,47.5432,25.2345,Ascunsă în pădure,75
