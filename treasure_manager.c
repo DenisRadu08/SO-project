@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
 
 
 typedef struct{
@@ -234,6 +235,145 @@ void view(const char *hunt_id, const char *tr_id)
 
 }
 
+void remove_treasure(const char *hunt_id, const char *tr_id)
+{
+    char file[512];
+    snprintf(file, sizeof(file), "./%s/treasure.txt", hunt_id);
+
+    int fd = open(file, O_RDONLY);
+    if (fd == -1) 
+    {
+        write_txt("Error opening the file\n");
+        exit(-1);
+    }
+
+    char buffer[4096];
+    int total_bytes = read(fd, buffer, sizeof(buffer));
+    if (total_bytes == -1) 
+    {
+        write_txt("Error reading the file\n");
+        close(fd);
+        exit(-1);
+    }
+    close(fd);
+
+    char aux_file[512];
+    snprintf(aux_file, sizeof(aux_file), "./%s/treasure_temp.txt", hunt_id);
+
+    int aux_fd = open(aux_file, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+    if (aux_fd == -1)
+    {
+        write_txt("Error opening temporary file\n");
+        exit(-1);
+    }
+
+    int ok=0;
+    char text[2048];
+    int index = 0;
+    for (int i = 0; i < total_bytes; i++) 
+    {
+        char c = buffer[i];
+        
+        if (c == '\n' || index >= sizeof(text) - 1) 
+        {
+            text[index] = '\0';
+            if (strlen(text) > 0) 
+            {
+                int id, value;
+                char name[32], clue[1028];
+                float latitude, longitude;
+
+                char *token = strtok(text, ",");
+                id = atoi(token);
+
+                token = strtok(NULL, ",");
+                strcpy(name, token);
+
+                token = strtok(NULL, ",");
+                latitude = atof(token);
+
+                token = strtok(NULL, ",");
+                longitude = atof(token);
+
+                token = strtok(NULL, ",");
+                strcpy(clue, token);
+
+                token = strtok(NULL, ",");
+                value = atoi(token);
+
+                if (id != atoi(tr_id))
+                {
+                    char msg[2048];
+                    snprintf(msg, sizeof(msg),"%d,%s,%.2f,%.2f,%s,%d\n",id, name, latitude, longitude, clue, value);
+                    write(aux_fd, msg, strlen(msg));
+                }
+                else
+                {
+                    ok=1;
+                }
+            }
+            index = 0;
+        } 
+        else 
+        {
+            text[index++] = c;
+        }
+    }
+
+    close(aux_fd);
+
+    if (remove(file) != 0)
+    {
+        write_txt("Error removing old file\n");
+        exit(-1);
+    }
+
+    if (rename(aux_file, file) != 0)
+    {
+        write_txt("Error renaming temporary file\n");
+        exit(-1);
+    }
+
+    if(ok==1)
+    {
+        write_txt("Treasure was removed successfully.\n");
+    }
+    else
+    {
+        write_txt("Non existent ID so there was no treasure removed.\n");
+    }
+}
+
+
+void remove_hunt(const char *hunt_id)
+{
+    char dir_path[256];
+    snprintf(dir_path,sizeof(dir_path),"./%s",hunt_id);
+
+    struct stat st;
+    if(stat(dir_path,&st)==-1 || !S_ISDIR(st.st_mode))
+    {
+        write_txt("Non-existent hunt");
+    }
+
+    char file_path[512];
+    snprintf(file_path,sizeof(file_path),"%s/treasure.txt",dir_path);
+
+    if(remove(file_path)==-1)
+    {
+        write_txt("Error when removing the treasure.\n");
+    }
+
+    if(rmdir(dir_path)==-1)
+    {
+        write_txt("Error when removing hunt directory.\n");
+    }
+    else
+    {
+        write_txt("Hunt was removed succesfully!");
+    }
+}
+
 int main(int argc,char **argv)
 {
     if(argc<3)
@@ -253,6 +393,14 @@ int main(int argc,char **argv)
     else if(strcmp(argv[1],"view")==0)
     {
         view(argv[2],argv[3]);
+    }
+    else if(strcmp(argv[1],"remove_treasure")==0)
+    {
+        remove_treasure(argv[2],argv[3]);
+    }
+    else if(strcmp(argv[1],"remove_hunt")==0)
+    {
+        remove_hunt(argv[2]);
     }
     else
     {
