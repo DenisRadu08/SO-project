@@ -125,7 +125,7 @@ void list_hunts()
     DIR *dir = opendir("."); //Open current directory
     if (dir == NULL) 
     {
-        write(monitor_pipe_fd[1], "Error: Failed to open directory\n", strlen("Error: Failed to open directory\n"));
+        write(monitor_pipe_fd[1], "Error when opening directory\n", strlen("Error when opening directory\n"));
         return;
     }
 
@@ -160,6 +160,7 @@ void list_hunts()
 //Variables which track monitor state
 static pid_t monitor_pid = 0; //Stores the monitor's pid
 static int monitor_stopping = 0; //1 if stop_monitor was called, 0 if not
+static volatile int command_done = 0; //Flag for SIGUSR2
 //Handler for SIGCHLD to detect when monitor is stopped
 void handle_sigchld(int sig) 
 {
@@ -187,7 +188,8 @@ void handle_sigusr1(int sig)
     int fd = open("/tmp/treasure_hub_cmd.txt", O_RDONLY);
     if (fd == -1) 
     {
-        write(monitor_pipe_fd[1], "Error: Failed to read command file\n", strlen("Error: Failed to read command file\n"));
+        write(monitor_pipe_fd[1], "Error when trying to read command file\n", strlen("Error when trying to read command file\n"));
+        kill(getppid(), SIGUSR2);
         return;
     }
 
@@ -196,7 +198,8 @@ void handle_sigusr1(int sig)
     close(fd);
     if (n <= 0) 
     {
-        write(monitor_pipe_fd[1], "Error: Empty command file\n", strlen("Error: Empty command file\n"));
+        write(monitor_pipe_fd[1], "Empty command file\n", strlen("Empty command file\n"));
+        kill(getppid(),SIGUSR2);
         return;
     }
 
@@ -206,49 +209,150 @@ void handle_sigusr1(int sig)
     char *cmd = strtok(buffer, " ");
      if (cmd == NULL) 
      {
-         write(monitor_pipe_fd[1], "Error: Invalid command format\n", strlen("Error: Invalid command format\n"));
+         write(monitor_pipe_fd[1], "Invalid command format\n", strlen("Invalid command format\n"));
+         kill(getppid(), SIGUSR2);
          return;
      }
      if (strcmp(cmd, "list_hunts") == 0) 
      {
          list_hunts();
+         kill(getppid(), SIGUSR2);
      } else if (strcmp(cmd, "list_treasures") == 0) 
      {
          char *hunt_id = strtok(NULL, " ");
          if (hunt_id == NULL) 
          {
-             write(monitor_pipe_fd[1], "Error: Missing hunt ID\n", strlen("Error: Missing hunt ID\n"));
+             write(monitor_pipe_fd[1], "Missing hunt ID\n", strlen("Missing hunt ID\n"));
+             kill(getppid(), SIGUSR2);
              return;
          }
          list(hunt_id);
+         kill(getppid(), SIGUSR2);
      } else if (strcmp(cmd, "view_treasure") == 0) 
      {
          char *hunt_id = strtok(NULL, " ");
          if (hunt_id == NULL) 
          {
-             write(monitor_pipe_fd[1], "Error: Missing hunt ID\n", strlen("Error: Missing hunt ID\n"));
+             write(monitor_pipe_fd[1], "Missing hunt ID\n", strlen("Missing hunt ID\n"));
+             kill(getppid(), SIGUSR2);
              return;
          }
          char *tr_id = strtok(NULL, " ");
          if (tr_id == NULL) 
          {
-             write(monitor_pipe_fd[1], "Error: Missing treasure ID\n", strlen("Error: Missing treasure ID\n"));
+             write(monitor_pipe_fd[1], "Missing treasure ID\n", strlen("Missing treasure ID\n"));
+             kill(getppid(), SIGUSR2);
              return;
          }
          view(hunt_id, tr_id);
-     } else 
+         kill(getppid(), SIGUSR2);
+     } 
+     else if(strcmp(cmd, "calculate_score") == 0)
      {
-         write(monitor_pipe_fd[1], "Error: Unknown monitor command\n", strlen("Error: Unknown monitor command\n"));
-     }
-    
+        DIR *dir = opendir(".");
+        if(dir == NULL)
+        {
+            write(monitor_pipe_fd[1], "Failed to open directory\n", strlen("Failed to open directory\n"));
+            kill(getppid(), SIGUSR2);
+            return;
+        }
+        rewinddir(dir); //Reset directory so all the time entries are read from the start
+        
+        struct dirent *entry = NULL;
+        while((entry = readdir(dir)) != NULL)
+        {
+            if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            {
+                continue;
+            }
+            if(entry->d_type == DT_DIR)
+            {
+                char file[512];
+                snprintf(file, sizeof(file), "./%s/treasure.bin", entry->d_name);
+                struct stat st;
+                if (stat(file, &st) == 0)
+                {
+                    int pipe_fd[2];
+                    if(pipe(pipe_fd) == -1)
+                    {
+                        write(monitor_pipe_fd[1], "Failed to create pipe\n", strlen("Failed to create pipe\n"));
+                        continue;
+                    }
+                    
+                    pid_t pid = fork();
+                    if (pid == -1)
+                    {
+                        write(monitor_pipe_fd[1], "Failed to fork\n", strlen("Failed to fork\n"));
+                        close(pipe_fd[0]);
+                        close(pipe_fd[1]);
+                        continue;
+                    }
 
+                    if (pid == 0)
+                    { //Child
+                        close(pipe_fd[0]);
+                        dup2(pipe_fd[1], 1);
+                        close(pipe_fd[1]);
+                        close(monitor_pipe_fd[0]);
+                        close(monitor_pipe_fd[1]);
+                        execl("./score_calculator", "score_calculator", entry->d_name, (char *)NULL);
+                        
+                        write(1, "Failed to execute\n", strlen("Failed to execute\n"));
+                        exit(1);
+                    }
+                    else
+                    {
+                        //Parent
+                        close(pipe_fd[1]);
+                        char buffer[512];
+                        int bytes;
+                        int read_attempts = 0;
+                        const int max_attempts = 100; //To solve the infinite loop glitch
+                        while ((bytes = read(pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0 && read_attempts < max_attempts)
+                        {
+                            buffer[bytes] = '\0';
+                            write(monitor_pipe_fd[1], buffer, bytes);
+                            read_attempts++;
+                        }
+
+                        if(read_attempts >= max_attempts)
+                        {
+                            write(monitor_pipe_fd[1], "Read timeout on pipe\n", strlen("Read timeout on pipe\n"));
+                        }
+
+                        if (bytes == -1)
+                        {
+                            write(monitor_pipe_fd[1], "Failed to read from pipe\n", strlen("Failed to read from pipe\n"));
+                        }
+
+                        close(pipe_fd[0]);
+                        int status;
+                        waitpid(pid, &status, 0);
+                    }
+                }
+            }
+        }
+        closedir(dir);
+        kill(getppid(), SIGUSR2);
+     }
+     else 
+    {
+        write(monitor_pipe_fd[1], "Unknown monitor command\n", strlen("Unknown monitor command\n"));
+        kill(getppid(), SIGUSR2);
+    }
+    kill(getppid(), SIGUSR2);
+}
+
+void handle_sigusr2(int sig)
+{
+    command_done=1;
 }
 
 //Handler for SIGTERM in the monitor (for stop_monitor)
 void handle_sigterm(int sig) 
 {
-    write(1, "Monitor stopping, waiting 2 seconds...\n",strlen("Monitor stopping, waiting 2 seconds...\n"));
-    usleep(2000000); //Wait 2 seconds
+    write(monitor_pipe_fd[1], "Monitor stopping, waiting 2 seconds...\n",strlen("Monitor stopping, waiting 2 seconds...\n"));
+    sleep(2); //Wait 2 seconds
     exit(0); //Exit monitor process
 }
 
@@ -276,7 +380,7 @@ void start_monitor()
 {
     if (monitor_pid != 0) //Check if monitor is already running
     {    
-        write(1, "Error: Monitor already running\n", strlen("Error: Monitor already running\n"));
+        write(1, "Monitor already running\n", strlen("Monitor already running\n"));
         return;
     }
 
@@ -291,7 +395,7 @@ void start_monitor()
     
     if (pid < 0) //Fork failed
     {
-        write(1, "Error: Fork failed\n", strlen("Error: Fork failed\n"));
+        write(1, "Fork failed\n", strlen("Fork failed\n"));
         close(pipe_fd[0]);
         close(pipe_fd[1]);
         return;
@@ -317,16 +421,11 @@ void start_monitor()
 
 void send_command_to_monitor(const char *cmd, const char *hunt_id, const char *tr_id) 
 {
-    if (monitor_pid == 0) 
-    {
-        write(1, "Error: No monitor running\n", strlen("Error: No monitor running\n"));
-        return;
-    }
 
     int fd = open("/tmp/treasure_hub_cmd.txt", O_WRONLY | O_CREAT | O_TRUNC, 0777);
     if (fd == -1) 
     {
-        write(1, "Error: Failed to write command file\n", strlen("Error: Failed to write command file\n"));
+        write(1, "Failed to write command file\n", strlen("Failed to write command file\n"));
         return;
     }
 
@@ -345,16 +444,17 @@ void send_command_to_monitor(const char *cmd, const char *hunt_id, const char *t
     }
 
     close(fd);
+    command_done = 0; //Reset flag
     
     if (kill(monitor_pid, SIGUSR1) == -1) 
     {
-        write(1, "Error: Failed to signal monitor\n", strlen("Error: Failed to signal monitor\n"));
+        write(1, "Failed to signal monitor\n", strlen("Failed to signal monitor\n"));
         return;
     }
 
     char buffer[4096];
     int bytes;
-    while ((bytes = read(monitor_pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) 
+    while (!command_done && (bytes = read(monitor_pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0) 
     {
         buffer[bytes] = '\0';
         write(1, buffer, bytes);
@@ -367,18 +467,26 @@ void stop_monitor()
 {
     if (monitor_pid == 0) //Check if monitor is running
     {  
-        write(1, "Error: No monitor running\n", strlen("Error: No monitor running\n"));
+        write(1, "No monitor running\n", strlen("No monitor running\n"));
         return;
     }
 
     if (kill(monitor_pid, SIGTERM) == -1)  //Send SIGTERM to monitor
     {   
-        write(1, "Error: Failed to stop monitor\n", strlen("Error: Failed to stop monitor\n"));
+        write(1, "Failed to stop monitor\n", strlen("Failed to stop monitor\n"));
         return;
     }
 
     monitor_stopping = 1; //Mark monitor as stopping (other commands will not work anymore)
     write(1, "Stopping monitor\n", strlen("Stopping monitor\n"));
+
+    char buffer[4096];
+    int bytes;
+    while((bytes = read(monitor_pipe_fd[0], buffer, sizeof(buffer) - 1)) > 0)
+    {
+        buffer[bytes] = '\0';
+        write(1, buffer, bytes);
+    }
 
     //Wait for monitor to terminate
     int waited = 0;
@@ -389,7 +497,7 @@ void stop_monitor()
     }
     if (monitor_pid != 0)  //Monitor didn't terminate in time
     {
-        write(1, "Warning: Monitor termination timed out\n",strlen("Warning: Monitor termination timed out\n"));
+        write(1, "Monitor termination timed out\n",strlen("Monitor termination timed out\n"));
     }
     close(monitor_pipe_fd[0]);
     monitor_pipe_fd[0] = -1;
@@ -401,10 +509,12 @@ int main()
 {
     //Set up SIGCHLD handler to catch monitor termination
     struct sigaction sa;
-    sa.sa_handler = handle_sigchld; //Call handle_sigchld on SIGCHLD
+    sa.sa_handler = handle_sigchld;
     sa.sa_flags = SA_RESTART;//Restart interrupted system calls
     sigemptyset(&sa.sa_mask); 
     sigaction(SIGCHLD, &sa, NULL);
+    sa.sa_handler = handle_sigusr2;
+    sigaction(SIGUSR2, &sa, NULL);
 
     char command[512];
     while (1)  //Loop to read user commands
@@ -418,7 +528,7 @@ int main()
 
         if (monitor_stopping && strcmp(command, "exit") != 0) 
         {
-            write(1, "Error: Monitor is stopping\n", strlen("Error: Monitor is stopping\n"));
+            write(1, "Monitor is stopping\n", strlen("Monitor is stopping\n"));
             continue;
         }
 
@@ -432,11 +542,20 @@ int main()
         }
         else if (strcmp(command, "list_hunts") == 0) 
         {
-            
+            if (monitor_pid == 0) 
+            {
+                write(1, "No monitor running\n", strlen("No monitor running\n"));
+                continue;
+            }
             send_command_to_monitor("list_hunts",NULL,NULL);
         }
         else if (strcmp(command, "list_treasures") == 0) 
         {
+            if (monitor_pid == 0) 
+            {
+                write(1, "No monitor running\n", strlen("No monitor running\n"));
+                continue;
+            }
             write(1,"Enter hunt ID: ",strlen("Enter hunt ID: "));
             char hunt_id[256];
             read_input(hunt_id,sizeof(hunt_id));
@@ -444,7 +563,12 @@ int main()
 
         }
         else if (strcmp(command, "view_treasure") == 0)
-        { 
+        {
+            if (monitor_pid == 0) 
+            {
+                write(1, "No monitor running\n", strlen("No monitor running\n"));
+                continue;
+            } 
             write(1, "Enter hunt ID: ", strlen("Enter hunt ID: "));
             char hunt_id[256];
             read_input(hunt_id, sizeof(hunt_id));
@@ -454,11 +578,20 @@ int main()
             read_input(tr_id, sizeof(tr_id));
             send_command_to_monitor("view_treasure",hunt_id,tr_id);
         }
+        else if(strcmp(command, "calculate_score") == 0)
+        {
+            if(monitor_pid == 0)
+            {
+                write(1, "No monitor running\n", strlen("No monitor running\n"));
+                continue;
+            }
+            send_command_to_monitor("calculate_score", NULL, NULL);
+        }
         else if (strcmp(command, "exit") == 0) 
         {
             if (monitor_pid != 0) 
             {
-                write(1, "Error: Stop monitor first\n", strlen("Error: Stop monitor first\n"));
+                write(1, "Stop monitor first\n", strlen("Stop monitor first\n"));
             } 
             else 
             {
